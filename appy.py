@@ -87,6 +87,18 @@ def add_user(cedula, password, nombre):
     finally:
         conn.close()
 
+def delete_user(cedula):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute("DELETE FROM users WHERE cedula = ?", (cedula,))
+        conn.commit()
+        return True
+    except Exception as e:
+        return False
+    finally:
+        conn.close()
+
 def login_user(username, password):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -212,11 +224,11 @@ def menu_login():
 def admin_panel():
     st.header("📂 Panel de Administración")
     
-    tab_upload, tab_users = st.tabs(["📤 Cargar Nómina", "👥 Usuarios Registrados"])
+    tab_upload, tab_users = st.tabs(["📤 Cargar Nómina", "👥 Gestión de Usuarios"])
     
     with tab_upload:
         st.subheader("Cargar Archivos Masivos")
-        st.info("Seleccione el mes y año, luego suba el archivo ZIP. El sistema asignará los archivos según la cédula en el nombre.")
+        st.info("Seleccione el mes y año, luego suba el archivo ZIP. El sistema acumulará estos archivos en el historial de cada empleado.")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -226,13 +238,12 @@ def admin_panel():
             # Obtener numero de mes
             selected_month = [k for k, v in MESES.items() if v == selected_month_name][0]
 
-        uploaded_file = st.file_uploader("Archivo ZIP con Nóminas", type="zip")
+        uploaded_file = st.file_uploader(f"Cargar ZIP para {selected_month_name} {selected_year}", type="zip")
         
         if uploaded_file is not None:
             if st.button("Procesar y Guardar Archivos"):
                 with st.spinner('Procesando archivos...'):
                     try:
-                        # Crear carpeta especifica para el mes/año si se desea mejor organizacion fisica (opcional, aqui usamos DB)
                         # Guardar ZIP temporalmente
                         zip_path = os.path.join("data", "temp.zip")
                         with open(zip_path, "wb") as f:
@@ -243,18 +254,18 @@ def admin_panel():
                         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                             for file_info in zip_ref.infolist():
                                 if file_info.filename.endswith('.pdf') and not file_info.filename.startswith('__MACOSX'):
-                                    # Limpiar nombre de archivo (quitar rutas de carpetas si existen en el zip)
                                     filename = os.path.basename(file_info.filename)
                                     
-                                    # Guardar fisicamente en data/nominas/YYYY_MM_filename
-                                    safe_filename = f"{selected_year}_{selected_month}_{filename}"
+                                    # Generar nombre único incluyendo timestamp para evitar colisiones
+                                    timestamp = int(datetime.now().timestamp())
+                                    safe_filename = f"{selected_year}_{selected_month}_{timestamp}_{filename}"
                                     target_path = os.path.join(UPLOAD_DIR, safe_filename)
                                     
                                     # Extraer contenido
                                     with open(target_path, "wb") as f_out:
                                         f_out.write(zip_ref.read(file_info.filename))
                                     
-                                    # Buscar cédula en el nombre
+                                    # Buscar cédula
                                     match = re.search(r'\d{5,12}', filename)
                                     if match:
                                         cedula_encontrada = match.group(0)
@@ -269,15 +280,33 @@ def admin_panel():
 
     with tab_users:
         st.subheader("Base de Datos de Usuarios")
+        st.warning("⚠️ Cuidado: Eliminar un usuario es irreversible.")
+        
         users_df = get_all_users()
-        st.dataframe(users_df, use_container_width=True)
-        st.caption(f"Total de usuarios registrados: {len(users_df)}")
+        
+        if not users_df.empty:
+            for index, row in users_df.iterrows():
+                col1, col2, col3 = st.columns([2, 2, 1])
+                with col1:
+                    st.write(f"**{row['nombre']}**")
+                with col2:
+                    st.write(f"CC: {row['cedula']}")
+                with col3:
+                    if st.button("🗑️ Eliminar", key=f"del_{row['cedula']}"):
+                        if delete_user(row['cedula']):
+                            st.success(f"Usuario {row['nombre']} eliminado.")
+                            st.rerun()
+                        else:
+                            st.error("Error al eliminar.")
+                st.divider()
+        else:
+            st.info("No hay usuarios registrados aparte del administrador.")
 
 def worker_panel(cedula):
     st.header("📄 Mis Desprendibles de Nómina")
     
     # Filtros por Año y Mes
-    col1, col2, col3 = st.columns([1, 1, 2])
+    col1, col2 = st.columns(2)
     with col1:
         filter_year = st.selectbox("Filtrar por Año", [2023, 2024, 2025, 2026], index=1)
     with col2:
@@ -287,7 +316,6 @@ def worker_panel(cedula):
     df = get_files_by_cedula(cedula)
     
     if not df.empty:
-        # Mapear numero de mes a nombre para mostrar
         df['nombre_mes'] = df['month'].map(MESES)
         
         # Aplicar filtros
@@ -299,15 +327,14 @@ def worker_panel(cedula):
         filtered_df = df.loc[mask]
         
         if len(filtered_df) > 0:
-            st.write(f"Mostrando documentos de: **{filter_month_name} {filter_year}**")
+            st.write(f"Mostrando {len(filtered_df)} documentos encontrados:")
             
             for index, row in filtered_df.iterrows():
                 with st.container():
-                    # Tarjeta de documento
                     c1, c2, c3 = st.columns([3, 2, 2])
                     with c1:
                         st.subheader(f"📄 {row['filename']}")
-                        st.caption(f"Cargado el: {row['upload_date']}")
+                        st.caption(f"Subido el: {row['upload_date']}")
                     with c2:
                         st.info(f"{row['nombre_mes']} {row['year']}")
                     with c3:
@@ -324,10 +351,11 @@ def worker_panel(cedula):
                             st.error("Archivo no encontrado")
                     st.divider()
         else:
-            st.warning("No se encontraron desprendibles para la fecha seleccionada.")
+            st.warning(f"No hay desprendibles para {filter_month_name} de {filter_year}.")
     else:
         st.info("No tienes desprendibles cargados en el sistema aún.")
 
 if __name__ == '__main__':
     main()
+
 
