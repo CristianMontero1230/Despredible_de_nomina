@@ -35,11 +35,8 @@ MESES = {
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Tabla Usuarios
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (username TEXT PRIMARY KEY, password TEXT, nombre TEXT, cedula TEXT, role TEXT)''')
-    
-    # Tabla Archivos (Actualizada con mes y año)
     c.execute('''CREATE TABLE IF NOT EXISTS files
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT, cedula TEXT, 
                   upload_date DATE, file_path TEXT, month INTEGER, year INTEGER)''')
@@ -54,7 +51,6 @@ def init_db():
         except:
             pass
 
-    # Crear admin por defecto
     try:
         c.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?)", 
                   ('admin', make_hashes('admin123'), 'Administrador', '0000', 'admin'))
@@ -99,11 +95,9 @@ def delete_user(cedula):
         conn.close()
 
 def delete_file_registry(cedula, month, year):
-    """Borra el registro y el archivo físico de un usuario en un mes/año especifico"""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
-        # Obtener path para borrar físico
         c.execute("SELECT file_path FROM files WHERE cedula=? AND month=? AND year=?", (cedula, month, year))
         rows = c.fetchall()
         for row in rows:
@@ -112,7 +106,6 @@ def delete_file_registry(cedula, month, year):
                     os.remove(row[0])
                 except:
                     pass
-        # Borrar de DB
         c.execute("DELETE FROM files WHERE cedula=? AND month=? AND year=?", (cedula, month, year))
         conn.commit()
         return True
@@ -139,7 +132,6 @@ def get_files_by_cedula(cedula):
     return df
 
 def get_monthly_stats(year):
-    """Obtiene conteo de archivos por mes para un año dado"""
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql_query("SELECT month, COUNT(*) as count, MAX(upload_date) as last_update FROM files WHERE year=? GROUP BY month", conn, params=(year,))
     conn.close()
@@ -159,6 +151,40 @@ def register_file(filename, cedula, path, month, year):
               (filename, cedula, today, path, month, year))
     conn.commit()
     conn.close()
+
+# --- FUNCIONES DE ANÁLISIS INTELIGENTE ---
+
+def extract_cedula_from_filename(filename):
+    """
+    Intenta extraer la cédula de un nombre de archivo usando múltiples estrategias.
+    Retorna la cédula encontrada o None.
+    """
+    # 1. Limpieza básica: quitar extensión
+    name_only = os.path.splitext(filename)[0]
+    
+    # 2. Buscar todas las secuencias numéricas de 5 a 12 dígitos
+    #    Esto evita fechas como 2024 (4 digitos) o ids cortos
+    posibles_cedulas = re.findall(r'\b\d{5,12}\b', name_only)
+    
+    # 3. Filtrado inteligente
+    cedulas_validas = []
+    current_year = datetime.now().year
+    
+    for num in posibles_cedulas:
+        # Ignorar si parece un año reciente (ej: 2023, 2024, 2025)
+        if len(num) == 4 and (int(num) >= 2000 and int(num) <= 2030):
+            continue
+        cedulas_validas.append(num)
+    
+    if not cedulas_validas:
+        # Intento secundario: buscar numeros pegados a letras (ej: CC123456)
+        match_pegado = re.search(r'(?:cc|id|cedula|nit)[^\d]*(\d{5,12})', name_only, re.IGNORECASE)
+        if match_pegado:
+            return match_pegado.group(1)
+        return None
+    
+    # Si hay varios, devolvemos el más largo (usualmente la cedula es más larga que otros ids internos)
+    return max(cedulas_validas, key=len)
 
 # --- LÓGICA DE INTERFAZ ---
 
@@ -251,7 +277,6 @@ def admin_panel():
         with col_sel1:
             selected_year = st.selectbox("Año de Gestión", range(2023, 2030), index=datetime.now().year - 2023)
         with col_sel2:
-            # Selector solo para subida
             upload_month_name = st.selectbox("Mes para Subir Archivos", list(MESES.values()), index=datetime.now().month - 1)
             upload_month = [k for k, v in MESES.items() if v == upload_month_name][0]
             
@@ -259,34 +284,36 @@ def admin_panel():
         
         # --- SECCION 1: CARGA DE ARCHIVOS ---
         st.subheader(f"1. Cargar Archivos: {upload_month_name} {selected_year}")
-        st.info("⚠️ Si subes un archivo para un usuario que ya tenía nómina este mes, se reemplazará automáticamente.")
+        st.info("⚠️ El sistema analizará inteligentemente cada nombre de archivo para encontrar la cédula.")
         
         uploaded_file = st.file_uploader(f"Subir ZIP de Nómina", type="zip", key="zip_uploader")
         
         if uploaded_file is not None:
-            if st.button("Procesar y Guardar Archivos"):
-                with st.spinner('Procesando archivos...'):
+            if st.button("Procesar y Analizar Archivos"):
+                with st.spinner('Analizando archivos...'):
                     try:
                         zip_path = os.path.join("data", "temp.zip")
                         with open(zip_path, "wb") as f:
                             f.write(uploaded_file.getbuffer())
                         
-                        count = 0
-                        replaced = 0
+                        processed_count = 0
+                        replaced_count = 0
+                        failed_files = []
+                        success_files = []
+
                         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                             for file_info in zip_ref.infolist():
                                 if file_info.filename.endswith('.pdf') and not file_info.filename.startswith('__MACOSX'):
                                     filename = os.path.basename(file_info.filename)
-                                    match = re.search(r'\d{5,12}', filename)
                                     
-                                    if match:
-                                        cedula_encontrada = match.group(0)
-                                        
-                                        # 1. Borrar anterior si existe (REEMPLAZO)
+                                    # --- MOTOR DE EXTRACCIÓN INTELIGENTE ---
+                                    cedula_encontrada = extract_cedula_from_filename(filename)
+                                    
+                                    if cedula_encontrada:
+                                        # Éxito: Procesar
                                         if delete_file_registry(cedula_encontrada, upload_month, selected_year):
-                                            replaced += 1
+                                            replaced_count += 1
                                         
-                                        # 2. Guardar nuevo
                                         timestamp = int(datetime.now().timestamp())
                                         safe_filename = f"{selected_year}_{upload_month}_{timestamp}_{filename}"
                                         target_path = os.path.join(UPLOAD_DIR, safe_filename)
@@ -295,14 +322,36 @@ def admin_panel():
                                             f_out.write(zip_ref.read(file_info.filename))
                                             
                                         register_file(filename, cedula_encontrada, target_path, upload_month, selected_year)
-                                        count += 1
+                                        processed_count += 1
+                                        success_files.append({"Archivo": filename, "Cédula Detectada": cedula_encontrada})
+                                    else:
+                                        # Fallo: Registrar para reporte
+                                        failed_files.append(filename)
                         
-                        st.success(f"✅ Proceso completado. Archivos procesados: {count}. (Reemplazados: {replaced})")
                         os.remove(zip_path)
-                        st.rerun()
+                        
+                        # --- REPORTE DE RESULTADOS ---
+                        st.divider()
+                        st.subheader("📊 Reporte de Carga")
+                        
+                        col_res1, col_res2 = st.columns(2)
+                        col_res1.success(f"✅ Procesados Exitosamente: {processed_count}")
+                        if failed_files:
+                            col_res2.error(f"❌ No se pudo identificar cédula: {len(failed_files)}")
+                        else:
+                            col_res2.info("✨ Todos los archivos fueron identificados.")
+
+                        if success_files:
+                            with st.expander("Ver archivos cargados correctamente"):
+                                st.dataframe(pd.DataFrame(success_files))
+                                
+                        if failed_files:
+                            st.error("⚠️ ATENCIÓN: Los siguientes archivos no se cargaron porque el sistema no encontró una cédula válida en el nombre:")
+                            st.dataframe(pd.DataFrame(failed_files, columns=["Archivos Fallidos"]))
+                            st.caption("Consejo: Renombre estos archivos para que incluyan la cédula (ej: 'nomina_12345678.pdf') y vuelva a subirlos.")
                         
                     except Exception as e:
-                        st.error(f"Error al procesar el archivo: {e}")
+                        st.error(f"Error crítico al procesar el archivo: {e}")
         
         st.divider()
         
@@ -311,7 +360,6 @@ def admin_panel():
         
         stats_df = get_monthly_stats(selected_year)
         
-        # Crear estructura de datos para mostrar todos los meses
         month_data = []
         for m_num, m_name in MESES.items():
             row = stats_df[stats_df['month'] == m_num]
@@ -328,7 +376,6 @@ def admin_panel():
             
         display_df = pd.DataFrame(month_data)
         
-        # Estilos condicionales
         def style_rows(row):
             color = '#d4edda' if row['Archivos Cargados'] > 0 else '#f8f9fa'
             return [f'background-color: {color}'] * len(row)
@@ -347,8 +394,6 @@ def admin_panel():
         
         if not users_df.empty:
             st.metric("Total Usuarios Registrados", len(users_df))
-            
-            # Encabezados de tabla manual para mejor control de botones
             col_h1, col_h2, col_h3 = st.columns([2, 2, 1])
             col_h1.markdown("**Nombre**")
             col_h2.markdown("**Cédula**")
