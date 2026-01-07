@@ -44,7 +44,7 @@ def init_db():
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT, cedula TEXT, 
                   upload_date DATE, file_path TEXT, month INTEGER, year INTEGER)''')
     
-    # Migración simple: verificar si existen las columnas nuevas (para bases de datos existentes)
+    # Migración simple
     try:
         c.execute("SELECT month FROM files LIMIT 1")
     except sqlite3.OperationalError:
@@ -54,7 +54,7 @@ def init_db():
         except:
             pass
 
-    # Crear admin por defecto si no existe
+    # Crear admin por defecto
     try:
         c.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?)", 
                   ('admin', make_hashes('admin123'), 'Administrador', '0000', 'admin'))
@@ -73,7 +73,6 @@ def check_hashes(password, hashed_text):
     return False
 
 def add_user(cedula, password, nombre):
-    # Username es la misma cedula
     username = cedula
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -99,6 +98,29 @@ def delete_user(cedula):
     finally:
         conn.close()
 
+def delete_file_registry(cedula, month, year):
+    """Borra el registro y el archivo físico de un usuario en un mes/año especifico"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        # Obtener path para borrar físico
+        c.execute("SELECT file_path FROM files WHERE cedula=? AND month=? AND year=?", (cedula, month, year))
+        rows = c.fetchall()
+        for row in rows:
+            if row[0] and os.path.exists(row[0]):
+                try:
+                    os.remove(row[0])
+                except:
+                    pass
+        # Borrar de DB
+        c.execute("DELETE FROM files WHERE cedula=? AND month=? AND year=?", (cedula, month, year))
+        conn.commit()
+        return True
+    except Exception as e:
+        return False
+    finally:
+        conn.close()
+
 def login_user(username, password):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -116,10 +138,10 @@ def get_files_by_cedula(cedula):
     conn.close()
     return df
 
-def get_files_by_period(month, year):
-    """Obtiene todos los archivos de un mes y año especificos"""
+def get_monthly_stats(year):
+    """Obtiene conteo de archivos por mes para un año dado"""
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT cedula, filename, upload_date FROM files WHERE month = ? AND year = ?", conn, params=(month, year))
+    df = pd.read_sql_query("SELECT month, COUNT(*) as count, MAX(upload_date) as last_update FROM files WHERE year=? GROUP BY month", conn, params=(year,))
     conn.close()
     return df
 
@@ -143,31 +165,16 @@ def register_file(filename, cedula, path, month, year):
 def main():
     init_db()
     
-    # Estilos CSS personalizados
     st.markdown("""
         <style>
-        .main {
-            background-color: #f8f9fa;
-        }
-        .stButton>button {
-            width: 100%;
-            border-radius: 5px;
-            height: 3em;
-        }
-        .success-box {
-            padding: 1rem;
-            border-radius: 0.5rem;
-            background-color: #d4edda;
-            color: #155724;
-            margin-bottom: 1rem;
-        }
-        .status-ok {
-            color: green;
-            font-weight: bold;
-        }
-        .status-missing {
-            color: red;
-            font-weight: bold;
+        .main { background-color: #f8f9fa; }
+        .stButton>button { width: 100%; border-radius: 5px; height: 3em; }
+        .metric-card {
+            background-color: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            text-align: center;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -218,14 +225,12 @@ def menu_login():
     with tab2:
         st.subheader("Crear nueva cuenta")
         st.info("Su usuario será su número de cédula.")
-        
         new_name = st.text_input("Nombre Completo")
         new_cedula = st.text_input("Número de Cédula (Sin puntos ni comas)")
         new_pass = st.text_input("Crear Contraseña", type='password')
         
         if st.button("Registrarse"):
             if new_name and new_pass and new_cedula:
-                # Validar que cedula sea numerica
                 if not new_cedula.isdigit():
                     st.error("La cédula debe contener solo números.")
                 else:
@@ -244,16 +249,19 @@ def admin_panel():
     with tab_upload:
         col_sel1, col_sel2 = st.columns(2)
         with col_sel1:
-            selected_year = st.selectbox("Año de Nómina", range(2023, 2030), index=datetime.now().year - 2023)
+            selected_year = st.selectbox("Año de Gestión", range(2023, 2030), index=datetime.now().year - 2023)
         with col_sel2:
-            selected_month_name = st.selectbox("Mes de Nómina", list(MESES.values()), index=datetime.now().month - 1)
-            selected_month = [k for k, v in MESES.items() if v == selected_month_name][0]
+            # Selector solo para subida
+            upload_month_name = st.selectbox("Mes para Subir Archivos", list(MESES.values()), index=datetime.now().month - 1)
+            upload_month = [k for k, v in MESES.items() if v == upload_month_name][0]
             
         st.divider()
         
         # --- SECCION 1: CARGA DE ARCHIVOS ---
-        st.subheader(f"1. Cargar Archivos para {selected_month_name} {selected_year}")
-        uploaded_file = st.file_uploader(f"Subir ZIP", type="zip", key="zip_uploader")
+        st.subheader(f"1. Cargar Archivos: {upload_month_name} {selected_year}")
+        st.info("⚠️ Si subes un archivo para un usuario que ya tenía nómina este mes, se reemplazará automáticamente.")
+        
+        uploaded_file = st.file_uploader(f"Subir ZIP de Nómina", type="zip", key="zip_uploader")
         
         if uploaded_file is not None:
             if st.button("Procesar y Guardar Archivos"):
@@ -264,86 +272,72 @@ def admin_panel():
                             f.write(uploaded_file.getbuffer())
                         
                         count = 0
+                        replaced = 0
                         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                             for file_info in zip_ref.infolist():
                                 if file_info.filename.endswith('.pdf') and not file_info.filename.startswith('__MACOSX'):
                                     filename = os.path.basename(file_info.filename)
-                                    timestamp = int(datetime.now().timestamp())
-                                    safe_filename = f"{selected_year}_{selected_month}_{timestamp}_{filename}"
-                                    target_path = os.path.join(UPLOAD_DIR, safe_filename)
-                                    
-                                    with open(target_path, "wb") as f_out:
-                                        f_out.write(zip_ref.read(file_info.filename))
-                                    
                                     match = re.search(r'\d{5,12}', filename)
+                                    
                                     if match:
                                         cedula_encontrada = match.group(0)
-                                        register_file(filename, cedula_encontrada, target_path, selected_month, selected_year)
+                                        
+                                        # 1. Borrar anterior si existe (REEMPLAZO)
+                                        if delete_file_registry(cedula_encontrada, upload_month, selected_year):
+                                            replaced += 1
+                                        
+                                        # 2. Guardar nuevo
+                                        timestamp = int(datetime.now().timestamp())
+                                        safe_filename = f"{selected_year}_{upload_month}_{timestamp}_{filename}"
+                                        target_path = os.path.join(UPLOAD_DIR, safe_filename)
+                                        
+                                        with open(target_path, "wb") as f_out:
+                                            f_out.write(zip_ref.read(file_info.filename))
+                                            
+                                        register_file(filename, cedula_encontrada, target_path, upload_month, selected_year)
                                         count += 1
                         
-                        st.success(f"✅ Proceso completado. Se han guardado {count} archivos.")
+                        st.success(f"✅ Proceso completado. Archivos procesados: {count}. (Reemplazados: {replaced})")
                         os.remove(zip_path)
-                        st.rerun() # Recargar para actualizar tabla de abajo
+                        st.rerun()
                         
                     except Exception as e:
                         st.error(f"Error al procesar el archivo: {e}")
         
         st.divider()
         
-        # --- SECCION 2: ESTADO DE CARGA ---
-        st.subheader(f"2. Estado de Carga: {selected_month_name} {selected_year}")
+        # --- SECCION 2: RESUMEN POR MESES ---
+        st.subheader(f"2. Estado de Carga por Meses ({selected_year})")
         
-        # Obtener datos para cruzar
-        users_df = get_all_users()
-        files_df = get_files_by_period(selected_month, selected_year)
+        stats_df = get_monthly_stats(selected_year)
         
-        if not users_df.empty:
-            # Crear columna de estado
-            # Convertimos cedulas a string para asegurar match
-            users_df['cedula'] = users_df['cedula'].astype(str)
-            if not files_df.empty:
-                files_df['cedula'] = files_df['cedula'].astype(str)
-                # Identificar usuarios que tienen archivo
-                users_with_files = files_df['cedula'].unique()
-                users_df['Estado'] = users_df['cedula'].apply(lambda x: '✅ Cargado' if x in users_with_files else '❌ Pendiente')
-                
-                # Unir para mostrar nombre de archivo si existe
-                # Tomamos el ultimo archivo subido por usuario para ese mes
-                files_resumen = files_df.groupby('cedula').last()[['filename', 'upload_date']].reset_index()
-                merged_df = pd.merge(users_df, files_resumen, on='cedula', how='left')
-                merged_df['filename'] = merged_df['filename'].fillna('-')
-            else:
-                users_df['Estado'] = '❌ Pendiente'
-                merged_df = users_df.copy()
-                merged_df['filename'] = '-'
+        # Crear estructura de datos para mostrar todos los meses
+        month_data = []
+        for m_num, m_name in MESES.items():
+            row = stats_df[stats_df['month'] == m_num]
+            count = row.iloc[0]['count'] if not row.empty else 0
+            last_update = row.iloc[0]['last_update'] if not row.empty else "-"
+            status = "✅ Cargado" if count > 0 else "⚪ Sin datos"
+            
+            month_data.append({
+                "Mes": m_name,
+                "Estado": status,
+                "Archivos Cargados": count,
+                "Última Actualización": last_update
+            })
+            
+        display_df = pd.DataFrame(month_data)
+        
+        # Estilos condicionales
+        def style_rows(row):
+            color = '#d4edda' if row['Archivos Cargados'] > 0 else '#f8f9fa'
+            return [f'background-color: {color}'] * len(row)
 
-            # Métricas
-            total_users = len(users_df)
-            cargados = len(users_df[users_df['Estado'] == '✅ Cargado'])
-            pendientes = total_users - cargados
-            
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Total Empleados", total_users)
-            m2.metric("Nóminas Cargadas", cargados)
-            m3.metric("Faltantes", pendientes, delta_color="inverse")
-            
-            # Mostrar Tabla con colores
-            st.write("Detalle por Empleado:")
-            
-            # Estilizar tabla
-            def color_status(val):
-                color = '#d4edda' if val == '✅ Cargado' else '#f8d7da'
-                return f'background-color: {color}'
-
-            display_df = merged_df[['nombre', 'cedula', 'Estado', 'filename']]
-            display_df.columns = ['Nombre', 'Cédula', 'Estado', 'Archivo']
-            
-            st.dataframe(
-                display_df.style.applymap(color_status, subset=['Estado']),
-                use_container_width=True
-            )
-        else:
-            st.info("No hay usuarios registrados en el sistema para verificar.")
+        st.dataframe(
+            display_df.style.apply(style_rows, axis=1),
+            use_container_width=True,
+            hide_index=True
+        )
 
     with tab_users:
         st.subheader("Base de Datos de Usuarios")
@@ -352,19 +346,26 @@ def admin_panel():
         users_df = get_all_users()
         
         if not users_df.empty:
+            st.metric("Total Usuarios Registrados", len(users_df))
+            
+            # Encabezados de tabla manual para mejor control de botones
+            col_h1, col_h2, col_h3 = st.columns([2, 2, 1])
+            col_h1.markdown("**Nombre**")
+            col_h2.markdown("**Cédula**")
+            col_h3.markdown("**Acción**")
+            st.divider()
+
             for index, row in users_df.iterrows():
                 col1, col2, col3 = st.columns([2, 2, 1])
                 with col1:
-                    st.write(f"**{row['nombre']}**")
+                    st.write(row['nombre'])
                 with col2:
-                    st.write(f"CC: {row['cedula']}")
+                    st.write(row['cedula'])
                 with col3:
                     if st.button("🗑️ Eliminar", key=f"del_{row['cedula']}"):
                         if delete_user(row['cedula']):
                             st.success(f"Usuario {row['nombre']} eliminado.")
                             st.rerun()
-                        else:
-                            st.error("Error al eliminar.")
                 st.divider()
         else:
             st.info("No hay usuarios registrados aparte del administrador.")
@@ -372,20 +373,17 @@ def admin_panel():
 def worker_panel(cedula):
     st.header("📄 Mis Desprendibles de Nómina")
     
-    # Filtros por Año y Mes
     col1, col2 = st.columns(2)
     with col1:
         filter_year = st.selectbox("Filtrar por Año", [2023, 2024, 2025, 2026], index=1)
     with col2:
         filter_month_name = st.selectbox("Filtrar por Mes", ["Todos"] + list(MESES.values()))
     
-    # Obtener datos
     df = get_files_by_cedula(cedula)
     
     if not df.empty:
         df['nombre_mes'] = df['month'].map(MESES)
         
-        # Aplicar filtros
         mask = (df['year'] == filter_year)
         if filter_month_name != "Todos":
             filter_month = [k for k, v in MESES.items() if v == filter_month_name][0]
