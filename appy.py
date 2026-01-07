@@ -116,6 +116,13 @@ def get_files_by_cedula(cedula):
     conn.close()
     return df
 
+def get_files_by_period(month, year):
+    """Obtiene todos los archivos de un mes y año especificos"""
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query("SELECT cedula, filename, upload_date FROM files WHERE month = ? AND year = ?", conn, params=(month, year))
+    conn.close()
+    return df
+
 def get_all_users():
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql_query("SELECT nombre, cedula, role FROM users WHERE role != 'admin'", conn)
@@ -153,6 +160,14 @@ def main():
             background-color: #d4edda;
             color: #155724;
             margin-bottom: 1rem;
+        }
+        .status-ok {
+            color: green;
+            font-weight: bold;
+        }
+        .status-missing {
+            color: red;
+            font-weight: bold;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -224,59 +239,111 @@ def menu_login():
 def admin_panel():
     st.header("📂 Panel de Administración")
     
-    tab_upload, tab_users = st.tabs(["📤 Cargar Nómina", "👥 Gestión de Usuarios"])
+    tab_upload, tab_users = st.tabs(["📤 Gestión de Nómina", "👥 Gestión de Usuarios"])
     
     with tab_upload:
-        st.subheader("Cargar Archivos Masivos")
-        st.info("Seleccione el mes y año, luego suba el archivo ZIP. El sistema acumulará estos archivos en el historial de cada empleado.")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            selected_year = st.selectbox("Año", range(2023, 2030), index=datetime.now().year - 2023)
-        with col2:
-            selected_month_name = st.selectbox("Mes", list(MESES.values()), index=datetime.now().month - 1)
-            # Obtener numero de mes
+        col_sel1, col_sel2 = st.columns(2)
+        with col_sel1:
+            selected_year = st.selectbox("Año de Nómina", range(2023, 2030), index=datetime.now().year - 2023)
+        with col_sel2:
+            selected_month_name = st.selectbox("Mes de Nómina", list(MESES.values()), index=datetime.now().month - 1)
             selected_month = [k for k, v in MESES.items() if v == selected_month_name][0]
-
-        uploaded_file = st.file_uploader(f"Cargar ZIP para {selected_month_name} {selected_year}", type="zip")
+            
+        st.divider()
+        
+        # --- SECCION 1: CARGA DE ARCHIVOS ---
+        st.subheader(f"1. Cargar Archivos para {selected_month_name} {selected_year}")
+        uploaded_file = st.file_uploader(f"Subir ZIP", type="zip", key="zip_uploader")
         
         if uploaded_file is not None:
             if st.button("Procesar y Guardar Archivos"):
                 with st.spinner('Procesando archivos...'):
                     try:
-                        # Guardar ZIP temporalmente
                         zip_path = os.path.join("data", "temp.zip")
                         with open(zip_path, "wb") as f:
                             f.write(uploaded_file.getbuffer())
                         
-                        # Extraer y procesar
                         count = 0
                         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                             for file_info in zip_ref.infolist():
                                 if file_info.filename.endswith('.pdf') and not file_info.filename.startswith('__MACOSX'):
                                     filename = os.path.basename(file_info.filename)
-                                    
-                                    # Generar nombre único incluyendo timestamp para evitar colisiones
                                     timestamp = int(datetime.now().timestamp())
                                     safe_filename = f"{selected_year}_{selected_month}_{timestamp}_{filename}"
                                     target_path = os.path.join(UPLOAD_DIR, safe_filename)
                                     
-                                    # Extraer contenido
                                     with open(target_path, "wb") as f_out:
                                         f_out.write(zip_ref.read(file_info.filename))
                                     
-                                    # Buscar cédula
                                     match = re.search(r'\d{5,12}', filename)
                                     if match:
                                         cedula_encontrada = match.group(0)
                                         register_file(filename, cedula_encontrada, target_path, selected_month, selected_year)
                                         count += 1
                         
-                        st.success(f"✅ Proceso completado. Se han guardado {count} archivos para {selected_month_name} {selected_year}.")
+                        st.success(f"✅ Proceso completado. Se han guardado {count} archivos.")
                         os.remove(zip_path)
+                        st.rerun() # Recargar para actualizar tabla de abajo
                         
                     except Exception as e:
                         st.error(f"Error al procesar el archivo: {e}")
+        
+        st.divider()
+        
+        # --- SECCION 2: ESTADO DE CARGA ---
+        st.subheader(f"2. Estado de Carga: {selected_month_name} {selected_year}")
+        
+        # Obtener datos para cruzar
+        users_df = get_all_users()
+        files_df = get_files_by_period(selected_month, selected_year)
+        
+        if not users_df.empty:
+            # Crear columna de estado
+            # Convertimos cedulas a string para asegurar match
+            users_df['cedula'] = users_df['cedula'].astype(str)
+            if not files_df.empty:
+                files_df['cedula'] = files_df['cedula'].astype(str)
+                # Identificar usuarios que tienen archivo
+                users_with_files = files_df['cedula'].unique()
+                users_df['Estado'] = users_df['cedula'].apply(lambda x: '✅ Cargado' if x in users_with_files else '❌ Pendiente')
+                
+                # Unir para mostrar nombre de archivo si existe
+                # Tomamos el ultimo archivo subido por usuario para ese mes
+                files_resumen = files_df.groupby('cedula').last()[['filename', 'upload_date']].reset_index()
+                merged_df = pd.merge(users_df, files_resumen, on='cedula', how='left')
+                merged_df['filename'] = merged_df['filename'].fillna('-')
+            else:
+                users_df['Estado'] = '❌ Pendiente'
+                merged_df = users_df.copy()
+                merged_df['filename'] = '-'
+
+            # Métricas
+            total_users = len(users_df)
+            cargados = len(users_df[users_df['Estado'] == '✅ Cargado'])
+            pendientes = total_users - cargados
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Empleados", total_users)
+            m2.metric("Nóminas Cargadas", cargados)
+            m3.metric("Faltantes", pendientes, delta_color="inverse")
+            
+            # Mostrar Tabla con colores
+            st.write("Detalle por Empleado:")
+            
+            # Estilizar tabla
+            def color_status(val):
+                color = '#d4edda' if val == '✅ Cargado' else '#f8d7da'
+                return f'background-color: {color}'
+
+            display_df = merged_df[['nombre', 'cedula', 'Estado', 'filename']]
+            display_df.columns = ['Nombre', 'Cédula', 'Estado', 'Archivo']
+            
+            st.dataframe(
+                display_df.style.applymap(color_status, subset=['Estado']),
+                use_container_width=True
+            )
+        else:
+            st.info("No hay usuarios registrados en el sistema para verificar.")
 
     with tab_users:
         st.subheader("Base de Datos de Usuarios")
@@ -357,5 +424,3 @@ def worker_panel(cedula):
 
 if __name__ == '__main__':
     main()
-
-
